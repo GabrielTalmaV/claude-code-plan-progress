@@ -17,6 +17,7 @@
 #   planprogress.ps1 install [-Settings <path>]
 #   planprogress.ps1 sessions          # list every plan in this project's sessions
 #   planprogress.ps1 use <number>      # pin the status line to one of them
+#   planprogress.ps1 next              # cycle the pin to the next session
 #   planprogress.ps1 unpin             # back to automatic
 
 param(
@@ -36,6 +37,7 @@ param(
     [int]$TitleMaxLen,
     [switch]$CrossSession,
     [switch]$NoCrossSession,
+    [int]$CrossSessionMaxAge,
     [switch]$Show,
     [switch]$Reset,
     [string]$Settings,
@@ -58,6 +60,7 @@ function Load-Config {
         SHOW_TITLE    = "1"
         TITLE_MAX_LEN = "40"
         CROSS_SESSION = "1"
+        CROSS_SESSION_MAX_AGE_MIN = "180"
         PINNED_SESSION = ""
         LOCALE_CFG  = ""
     }
@@ -78,6 +81,7 @@ function Load-Config {
     if ($env:PLAN_PROGRESS_SHOW_TITLE) { $cfg.SHOW_TITLE = $env:PLAN_PROGRESS_SHOW_TITLE }
     if ($env:PLAN_PROGRESS_TITLE_MAX_LEN) { $cfg.TITLE_MAX_LEN = $env:PLAN_PROGRESS_TITLE_MAX_LEN }
     if ($env:PLAN_PROGRESS_CROSS_SESSION) { $cfg.CROSS_SESSION = $env:PLAN_PROGRESS_CROSS_SESSION }
+    if ($env:PLAN_PROGRESS_CROSS_SESSION_MAX_AGE_MIN) { $cfg.CROSS_SESSION_MAX_AGE_MIN = $env:PLAN_PROGRESS_CROSS_SESSION_MAX_AGE_MIN }
     if ($env:PLAN_PROGRESS_PINNED_SESSION) { $cfg.PINNED_SESSION = $env:PLAN_PROGRESS_PINNED_SESSION }
 
     $loc = $cfg.LOCALE_CFG
@@ -119,7 +123,12 @@ function Get-TodosFromTranscript($path) {
         try { $entry = $_ | ConvertFrom-Json } catch { return }
         if ($entry.type -ne "assistant") { return }
         foreach ($block in $entry.message.content) {
-            if ($block.type -eq "tool_use" -and $block.name -eq "TodoWrite") { $todos = $block.input.todos }
+            if ($block.type -eq "tool_use" -and $block.name -eq "TodoWrite") {
+                # A malformed/rejected TodoWrite call can log .input.todos as a
+                # raw string instead of an array - skip it rather than treat
+                # its character count as a task count.
+                if ($block.input.todos -is [array]) { $todos = $block.input.todos }
+            }
         }
     }
     return $todos
@@ -151,10 +160,11 @@ function Get-PlanTitle($path, [int]$maxLen) {
 # its own, check up to 5 sibling transcripts (most recently modified first)
 # for one with an incomplete TodoWrite list - e.g. a plan running in
 # another open tab.
-function Find-OtherActivePlan($currentPath) {
+function Find-OtherActivePlan($currentPath, [int]$maxAgeMinutes) {
     $dir = Split-Path -Parent $currentPath
+    $cutoff = (Get-Date).AddMinutes(-$maxAgeMinutes)
     $siblings = Get-ChildItem -Path $dir -Filter "*.jsonl" -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -ne $currentPath } |
+        Where-Object { $_.FullName -ne $currentPath -and $_.LastWriteTime -ge $cutoff } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 5
 
@@ -213,6 +223,7 @@ switch ($Command) {
         if ($PSBoundParameters.ContainsKey('TitleMaxLen')) { Set-ConfigKey "TITLE_MAX_LEN" $TitleMaxLen }
         if ($CrossSession) { Set-ConfigKey "CROSS_SESSION" "1" }
         if ($NoCrossSession) { Set-ConfigKey "CROSS_SESSION" "0" }
+        if ($PSBoundParameters.ContainsKey('CrossSessionMaxAge')) { Set-ConfigKey "CROSS_SESSION_MAX_AGE_MIN" $CrossSessionMaxAge }
         if ($Show) {
             $cfg = Load-Config
             $cfg.Keys | ForEach-Object { Write-Output "$_=$($cfg[$_])" }
@@ -282,6 +293,28 @@ switch ($Command) {
         Write-Output "Unpinned. Status line will follow the current session (falling back to other open sessions) automatically again."
         return
     }
+    "next" {
+        $projectDir = if ($Dir) { $Dir } else { Resolve-ProjectDir (if ($Cwd) { $Cwd } else { (Get-Location).Path }) }
+        if (-not (Test-Path $projectDir)) {
+            Write-Output "Project directory not found: $projectDir"
+            return
+        }
+        $cfg = Load-Config
+        $files = Get-ChildItem -Path $projectDir -Filter "*.jsonl" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+        if ($files.Count -eq 0) {
+            Write-Output "No sessions found in $projectDir."
+            return
+        }
+        $currentIndex = -1
+        for ($i = 0; $i -lt $files.Count; $i++) {
+            if ($files[$i].FullName -eq $cfg.PINNED_SESSION) { $currentIndex = $i }
+        }
+        $nextIndex = ($currentIndex + 1) % $files.Count
+        $chosen = $files[$nextIndex]
+        Set-ConfigKey "PINNED_SESSION" $chosen.FullName
+        Write-Output "Pinned the status line to: $($chosen.BaseName)  ($($nextIndex + 1)/$($files.Count))"
+        return
+    }
     "install" {
         $settingsFile = if ($Settings) { $Settings } else { Join-Path $env:USERPROFILE ".claude\settings.json" }
         if (-not (Test-Path $settingsFile)) { "{}" | Set-Content $settingsFile }
@@ -326,9 +359,9 @@ if (`$line2) { Write-Output "`$line1``n`$line2" } else { Write-Output `$line1 }
         if ($cfg.ENABLED -ne "1") { return }  # disabled: print nothing
 
         if ($cfg.LOCALE -eq "es") {
-            $labelTask = "Tarea"; $labelDone = "Plan completo"; $labelNone = "Sin plan activo"; $labelOtherSession = "otra sesión"; $labelPinned = "fijado"
+            $labelTask = "Tarea"; $labelDone = "Plan completo"; $labelNone = "Sin plan activo"; $labelOtherSession = "otra sesión"; $labelPinned = "fijado"; $labelWorking = "en curso"
         } else {
-            $labelTask = "Task"; $labelDone = "Plan complete"; $labelNone = "No active plan"; $labelOtherSession = "other session"; $labelPinned = "pinned"
+            $labelTask = "Task"; $labelDone = "Plan complete"; $labelNone = "No active plan"; $labelOtherSession = "other session"; $labelPinned = "pinned"; $labelWorking = "in progress"
         }
 
         $data = $input_json | ConvertFrom-Json
@@ -354,7 +387,7 @@ if (`$line2) { Write-Output "`$line1``n`$line2" } else { Write-Output `$line1 }
             $sourcePath = $transcriptPath
 
             if ((-not $todos -or $todos.Count -eq 0) -and $cfg.CROSS_SESSION -eq "1") {
-                $found = Find-OtherActivePlan $transcriptPath
+                $found = Find-OtherActivePlan $transcriptPath ([int]$cfg.CROSS_SESSION_MAX_AGE_MIN)
                 if ($found) {
                     $todos = $found.Todos
                     $sourcePath = $found.Path
@@ -381,7 +414,9 @@ if (`$line2) { Write-Output "`$line1``n`$line2" } else { Write-Output `$line1 }
             $currentIndex = $total
         } else {
             $pending = $todos | Where-Object { $_.status -eq "pending" } | Select-Object -First 1
-            $currentTitle = if ($pending) { $pending.content } else { $labelDone }
+            # completed < total but neither an in_progress nor a pending task
+            # was found: don't claim the plan is done, that would be wrong.
+            $currentTitle = if ($pending) { $pending.content } else { $labelWorking }
         }
 
         $barWidth = [int]$cfg.BAR_WIDTH

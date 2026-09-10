@@ -24,10 +24,11 @@
 #   planprogress.sh install [--settings <path>]
 #   planprogress.sh sessions                    # list every plan in this project's sessions
 #   planprogress.sh use <number>                # pin the status line to one of them
+#   planprogress.sh next                        # cycle the pin to the next session
 #   planprogress.sh unpin                       # back to automatic (current session, or most recent other one)
 
 set -f  # disable globbing
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config"
@@ -72,6 +73,7 @@ load_config() {
     SHOW_TITLE=1
     TITLE_MAX_LEN=40
     CROSS_SESSION=1
+    CROSS_SESSION_MAX_AGE_MIN=180
     PINNED_SESSION=""
     LOCALE_CFG=""
 
@@ -90,6 +92,7 @@ load_config() {
     [ -n "${PLAN_PROGRESS_SHOW_TITLE:-}" ] && SHOW_TITLE="$PLAN_PROGRESS_SHOW_TITLE"
     TITLE_MAX_LEN="${PLAN_PROGRESS_TITLE_MAX_LEN:-$TITLE_MAX_LEN}"
     [ -n "${PLAN_PROGRESS_CROSS_SESSION:-}" ] && CROSS_SESSION="$PLAN_PROGRESS_CROSS_SESSION"
+    CROSS_SESSION_MAX_AGE_MIN="${PLAN_PROGRESS_CROSS_SESSION_MAX_AGE_MIN:-$CROSS_SESSION_MAX_AGE_MIN}"
     PINNED_SESSION="${PLAN_PROGRESS_PINNED_SESSION:-$PINNED_SESSION}"
     LOCALE="${PLAN_PROGRESS_LOCALE:-$LOCALE_CFG}"
 
@@ -101,9 +104,9 @@ load_config() {
     fi
 
     if [ "$LOCALE" = "es" ]; then
-        LABEL_TASK="Tarea"; LABEL_DONE="Plan completo"; LABEL_NONE="Sin plan activo"; LABEL_OTHER_SESSION="otra sesión"; LABEL_PINNED="fijado"
+        LABEL_TASK="Tarea"; LABEL_DONE="Plan completo"; LABEL_NONE="Sin plan activo"; LABEL_OTHER_SESSION="otra sesión"; LABEL_PINNED="fijado"; LABEL_WORKING="en curso"
     else
-        LABEL_TASK="Task"; LABEL_DONE="Plan complete"; LABEL_NONE="No active plan"; LABEL_OTHER_SESSION="other session"; LABEL_PINNED="pinned"
+        LABEL_TASK="Task"; LABEL_DONE="Plan complete"; LABEL_NONE="No active plan"; LABEL_OTHER_SESSION="other session"; LABEL_PINNED="pinned"; LABEL_WORKING="in progress"
     fi
 }
 
@@ -134,6 +137,7 @@ cmd_config() {
             --title-max-len) set_config_key "TITLE_MAX_LEN" "$2"; shift 2 ;;
             --cross-session) set_config_key "CROSS_SESSION" "1"; shift ;;
             --no-cross-session) set_config_key "CROSS_SESSION" "0"; shift ;;
+            --cross-session-max-age) set_config_key "CROSS_SESSION_MAX_AGE_MIN" "$2"; shift 2 ;;
             --show) show=1; shift ;;
             --reset) do_reset=1; shift ;;
             *) echo "Unknown flag: $1" >&2; exit 1 ;;
@@ -157,6 +161,7 @@ cmd_config() {
         echo "SHOW_TITLE=$SHOW_TITLE"
         echo "TITLE_MAX_LEN=$TITLE_MAX_LEN"
         echo "CROSS_SESSION=$CROSS_SESSION"
+        echo "CROSS_SESSION_MAX_AGE_MIN=$CROSS_SESSION_MAX_AGE_MIN"
         echo "PINNED_SESSION=${PINNED_SESSION:-(none)}"
         echo "LOCALE=$LOCALE"
         echo "Config file: $CONFIG_FILE"
@@ -250,6 +255,43 @@ cmd_use() {
 cmd_unpin() {
     set_config_key "PINNED_SESSION" ""
     echo "Unpinned. Status line will follow the current session (falling back to other open sessions) automatically again."
+}
+
+# Cycles the pin forward through the project's sessions (wrapping around) -
+# quicker than looking up a number with 'sessions' each time you want to
+# check a different plan.
+cmd_next() {
+    local dir="" cwd="$PWD"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dir) dir="$2"; shift 2 ;;
+            --cwd) cwd="$2"; shift 2 ;;
+            *) echo "Unknown flag: $1" >&2; exit 1 ;;
+        esac
+    done
+    [ -z "$dir" ] && dir=$(resolve_project_dir "$cwd")
+    [ -d "$dir" ] || { echo "Project directory not found: $dir" >&2; exit 1; }
+
+    load_config
+
+    local files=() f
+    while IFS= read -r f; do files+=("$f"); done < <(set +f; ls -t "$dir"/*.jsonl 2>/dev/null)
+
+    local count=${#files[@]}
+    if [ "$count" -eq 0 ]; then
+        echo "No sessions found in $dir." >&2
+        exit 1
+    fi
+
+    local current_index=-1 i
+    for i in "${!files[@]}"; do
+        [ "${files[$i]}" = "$PINNED_SESSION" ] && current_index=$i
+    done
+
+    local next_index=$(( (current_index + 1) % count ))
+    local chosen="${files[$next_index]}"
+    set_config_key "PINNED_SESSION" "$chosen"
+    echo "Pinned the status line to: $(basename "$chosen" .jsonl)  ($((next_index + 1))/$count)"
 }
 
 cmd_status() {
@@ -384,7 +426,9 @@ render() {
             current_index=$total
         else
             current_title=$(echo "$todos_json" | jq -r '(.[] | select(.status == "pending") | .content) // empty' | head -1)
-            [ -z "$current_title" ] && current_title="$LABEL_DONE"
+            # completed < total but neither an in_progress nor a pending task
+            # was found: don't claim the plan is done, that would be wrong.
+            [ -z "$current_title" ] && current_title="$LABEL_WORKING"
         fi
     fi
 
@@ -436,11 +480,17 @@ render() {
 
 # Grabs the todos array from the most recent TodoWrite call in a transcript file.
 extract_todos() {
+    # `select(type == "array")` guards against a malformed/rejected TodoWrite
+    # call whose .input.todos wasn't parsed into an array (e.g. logged as a
+    # raw JSON string) - without it, jq's `length`/`.[]` on that value
+    # silently misbehaves (string length instead of item count) instead of
+    # erroring, producing a bogus, frozen-looking progress readout.
     jq -c '
         select(.type == "assistant") |
         .message.content[]? |
         select(.type == "tool_use" and .name == "TodoWrite") |
-        .input.todos
+        .input.todos |
+        select(type == "array")
     ' "$1" 2>/dev/null | tail -1
 }
 
@@ -457,6 +507,12 @@ find_other_active_plan() {
         [ "$other" = "$current" ] && continue
         checked=$((checked + 1))
         [ "$checked" -gt 5 ] && break
+
+        # Skip sessions that haven't been touched recently - an old,
+        # abandoned plan shouldn't get picked up and look "frozen" forever.
+        if [ -n "$(find "$other" -mmin +"$CROSS_SESSION_MAX_AGE_MIN" 2>/dev/null)" ]; then
+            continue
+        fi
 
         t=$(extract_todos "$other")
         [ -z "$t" ] || [ "$t" = "null" ] && continue
@@ -519,7 +575,8 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
         sessions) shift; cmd_sessions "$@" ;;
         use) shift; cmd_use "$@" ;;
         unpin) cmd_unpin ;;
+        next) shift; cmd_next "$@" ;;
         "") render ;;
-        *) echo "Unknown command: $1. Try: enable, disable, status, config, install, sessions, use, unpin" >&2; exit 1 ;;
+        *) echo "Unknown command: $1. Try: enable, disable, status, config, install, sessions, use, next, unpin" >&2; exit 1 ;;
     esac
 fi
