@@ -28,7 +28,7 @@
 #   planprogress.sh unpin                       # back to automatic (current session, or most recent other one)
 
 set -f  # disable globbing
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config"
@@ -104,9 +104,9 @@ load_config() {
     fi
 
     if [ "$LOCALE" = "es" ]; then
-        LABEL_TASK="Tarea"; LABEL_DONE="Plan completo"; LABEL_NONE="Sin plan activo"; LABEL_OTHER_SESSION="otra sesión"; LABEL_PINNED="fijado"; LABEL_WORKING="en curso"
+        LABEL_TASK="Tarea"; LABEL_DONE="Plan completo"; LABEL_NONE="Sin plan activo"; LABEL_OTHER_SESSION="otra sesión"; LABEL_PINNED="fijado"; LABEL_WORKING="en curso"; LABEL_TODOWRITE_DISABLED="TodoWrite deshabilitada en esta sesión"
     else
-        LABEL_TASK="Task"; LABEL_DONE="Plan complete"; LABEL_NONE="No active plan"; LABEL_OTHER_SESSION="other session"; LABEL_PINNED="pinned"; LABEL_WORKING="in progress"
+        LABEL_TASK="Task"; LABEL_DONE="Plan complete"; LABEL_NONE="No active plan"; LABEL_OTHER_SESSION="other session"; LABEL_PINNED="pinned"; LABEL_WORKING="in progress"; LABEL_TODOWRITE_DISABLED="TodoWrite disabled for this session"
     fi
 }
 
@@ -405,7 +405,9 @@ render() {
     fi
 
     if [ -z "$todos_json" ] || [ "$todos_json" = "null" ]; then
-        printf "%s | %s" "$model_name" "$(colorize "$LABEL_NONE" "dim")"
+        local none_label="$LABEL_NONE"
+        todowrite_disabled "$transcript_path" && none_label="$LABEL_TODOWRITE_DISABLED"
+        printf "%s | %s" "$model_name" "$(colorize "$none_label" "dim")"
         exit 0
     fi
 
@@ -480,18 +482,45 @@ render() {
 
 # Grabs the todos array from the most recent TodoWrite call in a transcript file.
 extract_todos() {
-    # `select(type == "array")` guards against a malformed/rejected TodoWrite
-    # call whose .input.todos wasn't parsed into an array (e.g. logged as a
-    # raw JSON string) - without it, jq's `length`/`.[]` on that value
-    # silently misbehaves (string length instead of item count) instead of
-    # erroring, producing a bogus, frozen-looking progress readout.
-    jq -c '
-        select(.type == "assistant") |
+    # Two defenses against a rejected TodoWrite call (e.g. the tool disabled
+    # for this session) polluting the reading:
+    #  - exclude any TodoWrite tool_use whose matching tool_result came back
+    #    as an error (its `.input.todos` may look perfectly valid but was
+    #    never actually applied - showing it would be stale/misleading);
+    #  - `select(type == "array")` as a second guard for the case where the
+    #    rejected call's .input.todos wasn't even parsed into an array (e.g.
+    #    logged as a raw JSON string) - without it, jq's `length`/`.[]` on
+    #    that value silently misbehaves (string length instead of item
+    #    count) instead of erroring, producing a bogus progress readout.
+    # Requires slurping the file (-s) to correlate tool_use/tool_result
+    # pairs by id across lines.
+    jq -c -s '
+        ( [.[] | select(.type == "user") | .message.content[]? | select(.type == "tool_result" and .is_error == true) | .tool_use_id] ) as $rejected |
+        [
+            .[] |
+            select(.type == "assistant") |
+            .message.content[]? |
+            select(.type == "tool_use" and .name == "TodoWrite") |
+            select(.id as $tid | ($rejected | index($tid)) == null) |
+            .input.todos |
+            select(type == "array")
+        ] | last
+    ' "$1" 2>/dev/null
+}
+
+# Detects a genuinely rejected TodoWrite call (the tool disabled for this
+# session/account) so "no plan" can be reported accurately instead of
+# implying Claude simply hasn't tracked one yet. Scoped to actual
+# tool_result blocks (is_error + the exact rejection text) rather than a
+# plain text search, so a chat message merely mentioning this error
+# doesn't produce a false positive.
+todowrite_disabled() {
+    jq -e '
+        select(.type == "user") |
         .message.content[]? |
-        select(.type == "tool_use" and .name == "TodoWrite") |
-        .input.todos |
-        select(type == "array")
-    ' "$1" 2>/dev/null | tail -1
+        select(.type == "tool_result" and .is_error == true) |
+        select(.content | type == "string" and test("TodoWrite is disabled"))
+    ' "$1" >/dev/null 2>&1
 }
 
 # Sessions in the same project (same cwd) write their transcripts into the

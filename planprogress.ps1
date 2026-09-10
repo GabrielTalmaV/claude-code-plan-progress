@@ -117,21 +117,55 @@ function Colorize($text, $name) {
 }
 
 function Get-TodosFromTranscript($path) {
+    # Two passes: first collect ids of any tool_result that came back as an
+    # error (e.g. TodoWrite disabled for this session), then read TodoWrite
+    # calls - skipping ones whose call was rejected (even if its
+    # .input.todos looks like a valid array, it was never actually applied)
+    # and ones whose .input.todos wasn't parsed into an array at all.
+    $rejectedIds = New-Object System.Collections.Generic.HashSet[string]
+    $lines = Get-Content -LiteralPath $path -ErrorAction SilentlyContinue
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try { $entry = $line | ConvertFrom-Json } catch { continue }
+        if ($entry.type -ne "user") { continue }
+        foreach ($block in $entry.message.content) {
+            if ($block.type -eq "tool_result" -and $block.is_error -eq $true) {
+                [void]$rejectedIds.Add($block.tool_use_id)
+            }
+        }
+    }
+
     $todos = $null
-    Get-Content -LiteralPath $path -ErrorAction SilentlyContinue | ForEach-Object {
-        if ([string]::IsNullOrWhiteSpace($_)) { return }
-        try { $entry = $_ | ConvertFrom-Json } catch { return }
-        if ($entry.type -ne "assistant") { return }
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try { $entry = $line | ConvertFrom-Json } catch { continue }
+        if ($entry.type -ne "assistant") { continue }
         foreach ($block in $entry.message.content) {
             if ($block.type -eq "tool_use" -and $block.name -eq "TodoWrite") {
-                # A malformed/rejected TodoWrite call can log .input.todos as a
-                # raw string instead of an array - skip it rather than treat
-                # its character count as a task count.
+                if ($rejectedIds.Contains($block.id)) { continue }
                 if ($block.input.todos -is [array]) { $todos = $block.input.todos }
             }
         }
     }
     return $todos
+}
+
+# Detects a genuinely rejected TodoWrite call (the tool disabled for this
+# session/account) so "no plan" can be reported accurately. Scoped to
+# actual tool_result blocks (is_error + the exact rejection text) rather
+# than a plain text search, so a chat message merely mentioning this error
+# doesn't produce a false positive.
+function Test-TodoWriteDisabled($path) {
+    Get-Content -LiteralPath $path -ErrorAction SilentlyContinue | ForEach-Object {
+        if ([string]::IsNullOrWhiteSpace($_)) { return }
+        try { $entry = $_ | ConvertFrom-Json } catch { return }
+        if ($entry.type -ne "user") { return }
+        foreach ($block in $entry.message.content) {
+            if ($block.type -eq "tool_result" -and $block.is_error -eq $true -and $block.content -is [string] -and $block.content -match "TodoWrite is disabled") {
+                return $true
+            }
+        }
+    } | Where-Object { $_ -eq $true } | Select-Object -First 1
 }
 
 # Pulls a short name for the plan out of the most recent ExitPlanMode call
@@ -359,9 +393,9 @@ if (`$line2) { Write-Output "`$line1``n`$line2" } else { Write-Output `$line1 }
         if ($cfg.ENABLED -ne "1") { return }  # disabled: print nothing
 
         if ($cfg.LOCALE -eq "es") {
-            $labelTask = "Tarea"; $labelDone = "Plan completo"; $labelNone = "Sin plan activo"; $labelOtherSession = "otra sesión"; $labelPinned = "fijado"; $labelWorking = "en curso"
+            $labelTask = "Tarea"; $labelDone = "Plan completo"; $labelNone = "Sin plan activo"; $labelOtherSession = "otra sesión"; $labelPinned = "fijado"; $labelWorking = "en curso"; $labelTodoWriteDisabled = "TodoWrite deshabilitada en esta sesión"
         } else {
-            $labelTask = "Task"; $labelDone = "Plan complete"; $labelNone = "No active plan"; $labelOtherSession = "other session"; $labelPinned = "pinned"; $labelWorking = "in progress"
+            $labelTask = "Task"; $labelDone = "Plan complete"; $labelNone = "No active plan"; $labelOtherSession = "other session"; $labelPinned = "pinned"; $labelWorking = "in progress"; $labelTodoWriteDisabled = "TodoWrite disabled for this session"
         }
 
         $data = $input_json | ConvertFrom-Json
@@ -397,7 +431,9 @@ if (`$line2) { Write-Output "`$line1``n`$line2" } else { Write-Output `$line1 }
         }
 
         if (-not $todos -or $todos.Count -eq 0) {
-            Write-Output "$modelName | $labelNone"
+            $noneLabel = $labelNone
+            if (Test-TodoWriteDisabled $transcriptPath) { $noneLabel = $labelTodoWriteDisabled }
+            Write-Output "$modelName | $noneLabel"
             return
         }
 

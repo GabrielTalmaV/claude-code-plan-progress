@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1
+
+- Fix: a TodoWrite call rejected by the backend (the tool disabled for a session/account) could still log a well-formed `.input.todos` array even though it was never actually applied - it's now excluded by correlating each TodoWrite call with its tool_result and skipping rejected ones, instead of only checking whether the value happened to parse as an array.
+- When no plan is found because of exactly this (TodoWrite disabled), the status line now says "TodoWrite disabled for this session" / "TodoWrite deshabilitada en esta sesión" instead of the generic "No active plan" - detected precisely from a matching `tool_result` error, so a chat message that merely mentions the phrase doesn't trigger a false positive.
+
 ## 1.3.0
 
 - Fix: a rejected/malformed `TodoWrite` call could log `.input.todos` as a raw JSON string instead of an array; the script now validates it's actually an array before reading it, instead of silently misinterpreting the string's character count as a task count (which showed a bogus, frozen-looking "Task 1/291 - Plan complete" readout).
