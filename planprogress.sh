@@ -9,19 +9,25 @@
 # transcript. Every time Claude updates its todo list (the TodoWrite tool,
 # the same list rendered in the CLI UI), that call is recorded in the
 # transcript. This script reads the *latest* TodoWrite call and renders it
-# as "Task 3/5 - title (60%) [bar]". No separate progress-state file needed.
+# as "Task 3/5 - title (60%) [bar] - Plan name". No separate progress-state
+# file needed - the plan name itself comes from the most recent
+# ExitPlanMode call (the plan approval step): its first heading line.
 #
 # CLI usage (run this script directly, with arguments, from a terminal):
 #   planprogress.sh enable
 #   planprogress.sh disable
 #   planprogress.sh status
 #   planprogress.sh config --width 20 --color cyan --filled-char "=" --empty-char "-"
+#   planprogress.sh config --no-title --title-max-len 30
 #   planprogress.sh config --show
 #   planprogress.sh config --reset
 #   planprogress.sh install [--settings <path>]
+#   planprogress.sh sessions                    # list every plan in this project's sessions
+#   planprogress.sh use <number>                # pin the status line to one of them
+#   planprogress.sh unpin                       # back to automatic (current session, or most recent other one)
 
 set -f  # disable globbing
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config"
@@ -63,6 +69,10 @@ load_config() {
     FILLED_CHAR="█"
     EMPTY_CHAR="░"
     NO_EMOJI=0
+    SHOW_TITLE=1
+    TITLE_MAX_LEN=40
+    CROSS_SESSION=1
+    PINNED_SESSION=""
     LOCALE_CFG=""
 
     if [ -f "$CONFIG_FILE" ]; then
@@ -77,6 +87,10 @@ load_config() {
     EMPTY_CHAR="${PLAN_PROGRESS_EMPTY_CHAR:-$EMPTY_CHAR}"
     [ -n "${PLAN_PROGRESS_NO_EMOJI:-}" ] && NO_EMOJI="$PLAN_PROGRESS_NO_EMOJI"
     [ -n "${PLAN_PROGRESS_ENABLED:-}" ] && ENABLED="$PLAN_PROGRESS_ENABLED"
+    [ -n "${PLAN_PROGRESS_SHOW_TITLE:-}" ] && SHOW_TITLE="$PLAN_PROGRESS_SHOW_TITLE"
+    TITLE_MAX_LEN="${PLAN_PROGRESS_TITLE_MAX_LEN:-$TITLE_MAX_LEN}"
+    [ -n "${PLAN_PROGRESS_CROSS_SESSION:-}" ] && CROSS_SESSION="$PLAN_PROGRESS_CROSS_SESSION"
+    PINNED_SESSION="${PLAN_PROGRESS_PINNED_SESSION:-$PINNED_SESSION}"
     LOCALE="${PLAN_PROGRESS_LOCALE:-$LOCALE_CFG}"
 
     if [ -z "$LOCALE" ]; then
@@ -87,9 +101,9 @@ load_config() {
     fi
 
     if [ "$LOCALE" = "es" ]; then
-        LABEL_TASK="Tarea"; LABEL_DONE="Plan completo"; LABEL_NONE="Sin plan activo"
+        LABEL_TASK="Tarea"; LABEL_DONE="Plan completo"; LABEL_NONE="Sin plan activo"; LABEL_OTHER_SESSION="otra sesión"; LABEL_PINNED="fijado"
     else
-        LABEL_TASK="Task"; LABEL_DONE="Plan complete"; LABEL_NONE="No active plan"
+        LABEL_TASK="Task"; LABEL_DONE="Plan complete"; LABEL_NONE="No active plan"; LABEL_OTHER_SESSION="other session"; LABEL_PINNED="pinned"
     fi
 }
 
@@ -115,6 +129,11 @@ cmd_config() {
             --locale) set_config_key "LOCALE_CFG" "$2"; shift 2 ;;
             --emoji) set_config_key "NO_EMOJI" "0"; shift ;;
             --no-emoji) set_config_key "NO_EMOJI" "1"; shift ;;
+            --title) set_config_key "SHOW_TITLE" "1"; shift ;;
+            --no-title) set_config_key "SHOW_TITLE" "0"; shift ;;
+            --title-max-len) set_config_key "TITLE_MAX_LEN" "$2"; shift 2 ;;
+            --cross-session) set_config_key "CROSS_SESSION" "1"; shift ;;
+            --no-cross-session) set_config_key "CROSS_SESSION" "0"; shift ;;
             --show) show=1; shift ;;
             --reset) do_reset=1; shift ;;
             *) echo "Unknown flag: $1" >&2; exit 1 ;;
@@ -135,9 +154,102 @@ cmd_config() {
         echo "FILLED_CHAR=$FILLED_CHAR"
         echo "EMPTY_CHAR=$EMPTY_CHAR"
         echo "NO_EMOJI=$NO_EMOJI"
+        echo "SHOW_TITLE=$SHOW_TITLE"
+        echo "TITLE_MAX_LEN=$TITLE_MAX_LEN"
+        echo "CROSS_SESSION=$CROSS_SESSION"
+        echo "PINNED_SESSION=${PINNED_SESSION:-(none)}"
         echo "LOCALE=$LOCALE"
         echo "Config file: $CONFIG_FILE"
     fi
+}
+
+# Best-effort mirror of how Claude Code names a project's transcript folder
+# under ~/.claude/projects/ (cwd with "/" replaced by "-"). Override with
+# --dir on 'sessions'/'use' if a project's real folder doesn't match.
+resolve_project_dir() {
+    local cwd="${1:-$PWD}" project_id
+    project_id=$(printf '%s' "$cwd" | sed 's/\//-/g')
+    printf '%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$project_id"
+}
+
+# Lists every session transcript for the current project (most recently
+# modified first) with its plan title and task progress, so you can see
+# every plan in flight and pick which one 'use' should pin the status line to.
+cmd_sessions() {
+    local dir="" cwd="$PWD"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dir) dir="$2"; shift 2 ;;
+            --cwd) cwd="$2"; shift 2 ;;
+            *) echo "Unknown flag: $1" >&2; exit 1 ;;
+        esac
+    done
+    [ -z "$dir" ] && dir=$(resolve_project_dir "$cwd")
+
+    if [ ! -d "$dir" ]; then
+        echo "No Claude Code project directory found at $dir" >&2
+        echo "Pass --dir <path> if this guess is wrong (project folders live under ~/.claude/projects/)." >&2
+        exit 1
+    fi
+
+    load_config
+    echo "Sessions in $dir:"
+    local i=0 f todos total completed title marker
+    while IFS= read -r f; do
+        i=$((i + 1))
+        todos=$(extract_todos "$f")
+        marker=""
+        [ "$f" = "$PINNED_SESSION" ] && marker=" [pinned]"
+        if [ -z "$todos" ] || [ "$todos" = "null" ]; then
+            printf "  %d) %s - no plan\n" "$i" "$(basename "$f" .jsonl)"
+            continue
+        fi
+        total=$(echo "$todos" | jq 'length')
+        completed=$(echo "$todos" | jq '[.[] | select(.status == "completed")] | length')
+        title=$(get_plan_title "$f")
+        [ -z "$title" ] && title="(untitled plan)"
+        printf "  %d) %s - %d/%d tasks - %s%s\n" "$i" "$(basename "$f" .jsonl)" "$completed" "$total" "$title" "$marker"
+    done < <(set +f; ls -t "$dir"/*.jsonl 2>/dev/null)
+
+    [ "$i" -eq 0 ] && echo "  (no sessions found)"
+    echo
+    echo "Run 'planprogress.sh use <number>' to pin the status line to one, or 'planprogress.sh unpin' for automatic mode."
+}
+
+cmd_use() {
+    local index="" dir="" cwd="$PWD"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dir) dir="$2"; shift 2 ;;
+            --cwd) cwd="$2"; shift 2 ;;
+            *) index="$1"; shift ;;
+        esac
+    done
+    if [ -z "$index" ]; then
+        echo "Usage: planprogress.sh use <number>   (run 'planprogress.sh sessions' to see the list)" >&2
+        exit 1
+    fi
+    [ -z "$dir" ] && dir=$(resolve_project_dir "$cwd")
+    [ -d "$dir" ] || { echo "Project directory not found: $dir" >&2; exit 1; }
+
+    local i=0 f chosen=""
+    while IFS= read -r f; do
+        i=$((i + 1))
+        if [ "$i" -eq "$index" ]; then chosen="$f"; break; fi
+    done < <(set +f; ls -t "$dir"/*.jsonl 2>/dev/null)
+
+    if [ -z "$chosen" ]; then
+        echo "No session #$index found. Run 'planprogress.sh sessions' first." >&2
+        exit 1
+    fi
+
+    set_config_key "PINNED_SESSION" "$chosen"
+    echo "Pinned the status line to: $(basename "$chosen" .jsonl)"
+}
+
+cmd_unpin() {
+    set_config_key "PINNED_SESSION" ""
+    echo "Unpinned. Status line will follow the current session (falling back to other open sessions) automatically again."
 }
 
 cmd_status() {
@@ -229,13 +341,26 @@ render() {
         exit 0
     fi
 
-    local todos_json
-    todos_json=$(jq -c '
-        select(.type == "assistant") |
-        .message.content[]? |
-        select(.type == "tool_use" and .name == "TodoWrite") |
-        .input.todos
-    ' "$transcript_path" 2>/dev/null | tail -1)
+    local todos_json source_path other_session=0 pinned_marker=0
+
+    if [ -n "$PINNED_SESSION" ] && [ -f "$PINNED_SESSION" ]; then
+        todos_json=$(extract_todos "$PINNED_SESSION")
+        source_path="$PINNED_SESSION"
+        [ "$PINNED_SESSION" != "$transcript_path" ] && pinned_marker=1
+    else
+        todos_json=$(extract_todos "$transcript_path")
+        source_path="$transcript_path"
+
+        if { [ -z "$todos_json" ] || [ "$todos_json" = "null" ]; } && [ "$CROSS_SESSION" = "1" ]; then
+            local found
+            found=$(find_other_active_plan "$transcript_path")
+            if [ -n "$found" ]; then
+                source_path="${found%%$'\t'*}"
+                todos_json="${found#*$'\t'}"
+                other_session=1
+            fi
+        fi
+    fi
 
     if [ -z "$todos_json" ] || [ "$todos_json" = "null" ]; then
         printf "%s | %s" "$model_name" "$(colorize "$LABEL_NONE" "dim")"
@@ -290,8 +415,87 @@ render() {
     pct_str=$(colorize "${pct}%" "$color_name")
     bar_str=$(colorize "$bar" "$color_name")
 
-    printf "%s | %s%s %d/%d - %s (%s) %s" \
-        "$model_name" "$emoji" "$LABEL_TASK" "$current_index" "$total" "$current_title" "$pct_str" "$bar_str"
+    local output
+    output=$(printf "%s | %s%s %d/%d - %s (%s) %s" \
+        "$model_name" "$emoji" "$LABEL_TASK" "$current_index" "$total" "$current_title" "$pct_str" "$bar_str")
+
+    if [ "$SHOW_TITLE" = "1" ]; then
+        local plan_title
+        plan_title=$(get_plan_title "$source_path")
+        [ -n "$plan_title" ] && output="$output - $plan_title"
+    fi
+
+    if [ "$pinned_marker" = "1" ]; then
+        output="$output $(colorize "($LABEL_PINNED)" "dim")"
+    elif [ "$other_session" = "1" ]; then
+        output="$output $(colorize "($LABEL_OTHER_SESSION)" "dim")"
+    fi
+
+    printf "%s" "$output"
+}
+
+# Grabs the todos array from the most recent TodoWrite call in a transcript file.
+extract_todos() {
+    jq -c '
+        select(.type == "assistant") |
+        .message.content[]? |
+        select(.type == "tool_use" and .name == "TodoWrite") |
+        .input.todos
+    ' "$1" 2>/dev/null | tail -1
+}
+
+# Sessions in the same project (same cwd) write their transcripts into the
+# same directory as this session's transcript_path. When THIS session has no
+# plan of its own, check sibling transcripts (most recently modified first,
+# capped so a busy project doesn't slow the status line down) for one with
+# an incomplete TodoWrite list - e.g. a plan running in another open tab.
+find_other_active_plan() {
+    local current="$1" dir other t tot comp checked=0
+    dir=$(dirname "$current")
+
+    while IFS= read -r other; do
+        [ "$other" = "$current" ] && continue
+        checked=$((checked + 1))
+        [ "$checked" -gt 5 ] && break
+
+        t=$(extract_todos "$other")
+        [ -z "$t" ] || [ "$t" = "null" ] && continue
+        tot=$(echo "$t" | jq 'length')
+        [ "$tot" -eq 0 ] 2>/dev/null && continue
+        comp=$(echo "$t" | jq '[.[] | select(.status == "completed")] | length')
+        if [ "$comp" -lt "$tot" ] 2>/dev/null; then
+            printf '%s\t%s' "$other" "$t"
+            return
+        fi
+    done < <(set +f; ls -t "$dir"/*.jsonl 2>/dev/null)
+}
+
+# Pulls a short name for the plan currently being implemented out of the
+# most recent ExitPlanMode call (the tool used when a plan is presented for
+# approval) - its `plan` input is the markdown plan text; we take the first
+# non-blank line (usually the heading) as the title.
+get_plan_title() {
+    local transcript_path="$1" raw line
+    # jq -c (not -r) keeps each matched plan as one escaped-JSON-string line
+    # (embedded newlines become literal \n) so `tail -1` grabs the *last
+    # whole record* instead of just the last physical line of plan text.
+    raw=$(jq -c '
+        select(.type == "assistant") |
+        .message.content[]? |
+        select(.type == "tool_use" and .name == "ExitPlanMode") |
+        .input.plan
+    ' "$transcript_path" 2>/dev/null | tail -1 | jq -r '.' 2>/dev/null)
+
+    [ -z "$raw" ] && return
+
+    line=$(printf '%s' "$raw" | awk 'NF{print; exit}')
+    line=$(printf '%s' "$line" | sed -E 's/^[#\*[:space:]]+//; s/[[:space:]]+$//')
+
+    if [ "${#line}" -gt "$TITLE_MAX_LEN" ]; then
+        line="${line:0:$TITLE_MAX_LEN}…"
+    fi
+
+    printf '%s' "$line"
 }
 
 colorize() {
@@ -304,13 +508,18 @@ colorize() {
     fi
 }
 
-# ===== Entry point =====
-case "${1:-}" in
-    enable) cmd_enable ;;
-    disable) cmd_disable ;;
-    status) cmd_status ;;
-    config) shift; cmd_config "$@" ;;
-    install) shift; cmd_install "$@" ;;
-    "") render ;;
-    *) echo "Unknown command: $1. Try: enable, disable, status, config, install" >&2; exit 1 ;;
-esac
+# ===== Entry point (skipped when the script is sourced, e.g. for testing) =====
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    case "${1:-}" in
+        enable) cmd_enable ;;
+        disable) cmd_disable ;;
+        status) cmd_status ;;
+        config) shift; cmd_config "$@" ;;
+        install) shift; cmd_install "$@" ;;
+        sessions) shift; cmd_sessions "$@" ;;
+        use) shift; cmd_use "$@" ;;
+        unpin) cmd_unpin ;;
+        "") render ;;
+        *) echo "Unknown command: $1. Try: enable, disable, status, config, install, sessions, use, unpin" >&2; exit 1 ;;
+    esac
+fi

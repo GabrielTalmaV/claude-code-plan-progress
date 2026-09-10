@@ -3,20 +3,27 @@
 # and doubles as a CLI to configure/enable/disable/install itself.
 #
 # See planprogress.sh for how rendering works (reads the latest TodoWrite
-# call from the session transcript referenced by stdin's transcript_path).
+# call from the session transcript referenced by stdin's transcript_path;
+# the plan title comes from the most recent ExitPlanMode call's heading).
 #
 # CLI usage:
 #   planprogress.ps1 enable
 #   planprogress.ps1 disable
 #   planprogress.ps1 status
 #   planprogress.ps1 config -Width 20 -Color cyan -FilledChar "=" -EmptyChar "-"
+#   planprogress.ps1 config -NoTitle -TitleMaxLen 30
 #   planprogress.ps1 config -Show
 #   planprogress.ps1 config -Reset
 #   planprogress.ps1 install [-Settings <path>]
+#   planprogress.ps1 sessions          # list every plan in this project's sessions
+#   planprogress.ps1 use <number>      # pin the status line to one of them
+#   planprogress.ps1 unpin             # back to automatic
 
 param(
     [Parameter(Position = 0)]
     [string]$Command,
+    [Parameter(Position = 1)]
+    [string]$Arg,
     [int]$Width,
     [string]$Color,
     [string]$FilledChar,
@@ -24,9 +31,16 @@ param(
     [string]$Locale,
     [switch]$Emoji,
     [switch]$NoEmoji,
+    [switch]$Title,
+    [switch]$NoTitle,
+    [int]$TitleMaxLen,
+    [switch]$CrossSession,
+    [switch]$NoCrossSession,
     [switch]$Show,
     [switch]$Reset,
-    [string]$Settings
+    [string]$Settings,
+    [string]$Dir,
+    [string]$Cwd
 )
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -41,6 +55,10 @@ function Load-Config {
         FILLED_CHAR = "█"
         EMPTY_CHAR  = "░"
         NO_EMOJI    = "0"
+        SHOW_TITLE    = "1"
+        TITLE_MAX_LEN = "40"
+        CROSS_SESSION = "1"
+        PINNED_SESSION = ""
         LOCALE_CFG  = ""
     }
     if (Test-Path $ConfigFile) {
@@ -57,6 +75,10 @@ function Load-Config {
     if ($env:PLAN_PROGRESS_NO_EMOJI) { $cfg.NO_EMOJI = $env:PLAN_PROGRESS_NO_EMOJI }
     if ($env:PLAN_PROGRESS_ENABLED) { $cfg.ENABLED = $env:PLAN_PROGRESS_ENABLED }
     if ($env:PLAN_PROGRESS_LOCALE) { $cfg.LOCALE_CFG = $env:PLAN_PROGRESS_LOCALE }
+    if ($env:PLAN_PROGRESS_SHOW_TITLE) { $cfg.SHOW_TITLE = $env:PLAN_PROGRESS_SHOW_TITLE }
+    if ($env:PLAN_PROGRESS_TITLE_MAX_LEN) { $cfg.TITLE_MAX_LEN = $env:PLAN_PROGRESS_TITLE_MAX_LEN }
+    if ($env:PLAN_PROGRESS_CROSS_SESSION) { $cfg.CROSS_SESSION = $env:PLAN_PROGRESS_CROSS_SESSION }
+    if ($env:PLAN_PROGRESS_PINNED_SESSION) { $cfg.PINNED_SESSION = $env:PLAN_PROGRESS_PINNED_SESSION }
 
     $loc = $cfg.LOCALE_CFG
     if (-not $loc) {
@@ -90,6 +112,71 @@ function Colorize($text, $name) {
     return "$code$text$esc[0m"
 }
 
+function Get-TodosFromTranscript($path) {
+    $todos = $null
+    Get-Content -LiteralPath $path -ErrorAction SilentlyContinue | ForEach-Object {
+        if ([string]::IsNullOrWhiteSpace($_)) { return }
+        try { $entry = $_ | ConvertFrom-Json } catch { return }
+        if ($entry.type -ne "assistant") { return }
+        foreach ($block in $entry.message.content) {
+            if ($block.type -eq "tool_use" -and $block.name -eq "TodoWrite") { $todos = $block.input.todos }
+        }
+    }
+    return $todos
+}
+
+# Pulls a short name for the plan out of the most recent ExitPlanMode call
+# (the plan-approval step) in a transcript - its first non-blank line,
+# usually the markdown heading.
+function Get-PlanTitle($path, [int]$maxLen) {
+    $planText = $null
+    Get-Content -LiteralPath $path -ErrorAction SilentlyContinue | ForEach-Object {
+        if ([string]::IsNullOrWhiteSpace($_)) { return }
+        try { $entry = $_ | ConvertFrom-Json } catch { return }
+        if ($entry.type -ne "assistant") { return }
+        foreach ($block in $entry.message.content) {
+            if ($block.type -eq "tool_use" -and $block.name -eq "ExitPlanMode") { $planText = $block.input.plan }
+        }
+    }
+    if (-not $planText) { return $null }
+    $line = ($planText -split "`n" | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
+    if (-not $line) { return $null }
+    $line = $line.Trim() -replace '^[#\*\s]+', '' -replace '\s+$', ''
+    if ($line.Length -gt $maxLen) { $line = $line.Substring(0, $maxLen) + "…" }
+    return $line
+}
+
+# Other sessions in the same project write their transcripts into the same
+# directory as this session's transcript. When this session has no plan of
+# its own, check up to 5 sibling transcripts (most recently modified first)
+# for one with an incomplete TodoWrite list - e.g. a plan running in
+# another open tab.
+function Find-OtherActivePlan($currentPath) {
+    $dir = Split-Path -Parent $currentPath
+    $siblings = Get-ChildItem -Path $dir -Filter "*.jsonl" -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -ne $currentPath } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 5
+
+    foreach ($f in $siblings) {
+        $todos = Get-TodosFromTranscript $f.FullName
+        if (-not $todos -or $todos.Count -eq 0) { continue }
+        $completed = ($todos | Where-Object { $_.status -eq "completed" }).Count
+        if ($completed -lt $todos.Count) {
+            return @{ Path = $f.FullName; Todos = $todos }
+        }
+    }
+    return $null
+}
+
+# Best-effort mirror of how Claude Code names a project's transcript folder
+# under ~/.claude/projects/ (cwd with "/" or "\" replaced by "-"). Override
+# with -Dir on 'sessions'/'use' if a project's real folder doesn't match.
+function Resolve-ProjectDir($cwdPath) {
+    $projectId = ($cwdPath -replace '[\\/]', '-')
+    return Join-Path (Join-Path $env:USERPROFILE ".claude") (Join-Path "projects" $projectId)
+}
+
 function Set-ConfigKey($key, $value) {
     $lines = @()
     if (Test-Path $ConfigFile) { $lines = Get-Content $ConfigFile }
@@ -121,6 +208,11 @@ switch ($Command) {
         if ($Locale) { Set-ConfigKey "LOCALE_CFG" $Locale }
         if ($Emoji) { Set-ConfigKey "NO_EMOJI" "0" }
         if ($NoEmoji) { Set-ConfigKey "NO_EMOJI" "1" }
+        if ($Title) { Set-ConfigKey "SHOW_TITLE" "1" }
+        if ($NoTitle) { Set-ConfigKey "SHOW_TITLE" "0" }
+        if ($PSBoundParameters.ContainsKey('TitleMaxLen')) { Set-ConfigKey "TITLE_MAX_LEN" $TitleMaxLen }
+        if ($CrossSession) { Set-ConfigKey "CROSS_SESSION" "1" }
+        if ($NoCrossSession) { Set-ConfigKey "CROSS_SESSION" "0" }
         if ($Show) {
             $cfg = Load-Config
             $cfg.Keys | ForEach-Object { Write-Output "$_=$($cfg[$_])" }
@@ -132,6 +224,62 @@ switch ($Command) {
         $cfg = Load-Config
         Write-Output ("Status: " + $(if ($cfg.ENABLED -eq "1") { "enabled" } else { "disabled" }))
         $cfg.Keys | ForEach-Object { Write-Output "$_=$($cfg[$_])" }
+        return
+    }
+    "sessions" {
+        $projectDir = if ($Dir) { $Dir } else { Resolve-ProjectDir (if ($Cwd) { $Cwd } else { (Get-Location).Path }) }
+        if (-not (Test-Path $projectDir)) {
+            Write-Output "No Claude Code project directory found at $projectDir"
+            Write-Output "Pass -Dir <path> if this guess is wrong (project folders live under ~/.claude/projects/)."
+            return
+        }
+        $cfg = Load-Config
+        Write-Output "Sessions in $projectDir`:"
+        $files = Get-ChildItem -Path $projectDir -Filter "*.jsonl" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+        $i = 0
+        foreach ($f in $files) {
+            $i++
+            $todos = Get-TodosFromTranscript $f.FullName
+            $marker = if ($f.FullName -eq $cfg.PINNED_SESSION) { " [pinned]" } else { "" }
+            if (-not $todos -or $todos.Count -eq 0) {
+                Write-Output "  $i) $($f.BaseName) - no plan"
+                continue
+            }
+            $total = $todos.Count
+            $completed = ($todos | Where-Object { $_.status -eq "completed" }).Count
+            $title = Get-PlanTitle $f.FullName 60
+            if (-not $title) { $title = "(untitled plan)" }
+            Write-Output "  $i) $($f.BaseName) - $completed/$total tasks - $title$marker"
+        }
+        if ($i -eq 0) { Write-Output "  (no sessions found)" }
+        Write-Output ""
+        Write-Output "Run 'planprogress.ps1 use <number>' to pin the status line to one, or 'planprogress.ps1 unpin' for automatic mode."
+        return
+    }
+    "use" {
+        if (-not $Arg) {
+            Write-Output "Usage: planprogress.ps1 use <number>   (run 'planprogress.ps1 sessions' to see the list)"
+            return
+        }
+        $projectDir = if ($Dir) { $Dir } else { Resolve-ProjectDir (if ($Cwd) { $Cwd } else { (Get-Location).Path }) }
+        if (-not (Test-Path $projectDir)) {
+            Write-Output "Project directory not found: $projectDir"
+            return
+        }
+        $files = Get-ChildItem -Path $projectDir -Filter "*.jsonl" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+        $index = [int]$Arg
+        if ($index -lt 1 -or $index -gt $files.Count) {
+            Write-Output "No session #$index found. Run 'planprogress.ps1 sessions' first."
+            return
+        }
+        $chosen = $files[$index - 1]
+        Set-ConfigKey "PINNED_SESSION" $chosen.FullName
+        Write-Output "Pinned the status line to: $($chosen.BaseName)"
+        return
+    }
+    "unpin" {
+        Set-ConfigKey "PINNED_SESSION" ""
+        Write-Output "Unpinned. Status line will follow the current session (falling back to other open sessions) automatically again."
         return
     }
     "install" {
@@ -178,9 +326,9 @@ if (`$line2) { Write-Output "`$line1``n`$line2" } else { Write-Output `$line1 }
         if ($cfg.ENABLED -ne "1") { return }  # disabled: print nothing
 
         if ($cfg.LOCALE -eq "es") {
-            $labelTask = "Tarea"; $labelDone = "Plan completo"; $labelNone = "Sin plan activo"
+            $labelTask = "Tarea"; $labelDone = "Plan completo"; $labelNone = "Sin plan activo"; $labelOtherSession = "otra sesión"; $labelPinned = "fijado"
         } else {
-            $labelTask = "Task"; $labelDone = "Plan complete"; $labelNone = "No active plan"
+            $labelTask = "Task"; $labelDone = "Plan complete"; $labelNone = "No active plan"; $labelOtherSession = "other session"; $labelPinned = "pinned"
         }
 
         $data = $input_json | ConvertFrom-Json
@@ -193,12 +341,25 @@ if (`$line2) { Write-Output "`$line1``n`$line2" } else { Write-Output `$line1 }
         }
 
         $todos = $null
-        Get-Content -LiteralPath $transcriptPath -ErrorAction SilentlyContinue | ForEach-Object {
-            if ([string]::IsNullOrWhiteSpace($_)) { return }
-            try { $entry = $_ | ConvertFrom-Json } catch { return }
-            if ($entry.type -ne "assistant") { return }
-            foreach ($block in $entry.message.content) {
-                if ($block.type -eq "tool_use" -and $block.name -eq "TodoWrite") { $todos = $block.input.todos }
+        $sourcePath = $transcriptPath
+        $otherSession = $false
+        $pinnedMarker = $false
+
+        if ($cfg.PINNED_SESSION -and (Test-Path $cfg.PINNED_SESSION)) {
+            $todos = Get-TodosFromTranscript $cfg.PINNED_SESSION
+            $sourcePath = $cfg.PINNED_SESSION
+            if ($cfg.PINNED_SESSION -ne $transcriptPath) { $pinnedMarker = $true }
+        } else {
+            $todos = Get-TodosFromTranscript $transcriptPath
+            $sourcePath = $transcriptPath
+
+            if ((-not $todos -or $todos.Count -eq 0) -and $cfg.CROSS_SESSION -eq "1") {
+                $found = Find-OtherActivePlan $transcriptPath
+                if ($found) {
+                    $todos = $found.Todos
+                    $sourcePath = $found.Path
+                    $otherSession = $true
+                }
             }
         }
 
@@ -236,6 +397,19 @@ if (`$line2) { Write-Output "`$line1``n`$line2" } else { Write-Output `$line1 }
         $pctStr = Colorize "$pct%" $colorName
         $barStr = Colorize $bar $colorName
 
-        Write-Output "$modelName | $emoji$labelTask $currentIndex/$total - $currentTitle ($pctStr) $barStr"
+        $line = "$modelName | $emoji$labelTask $currentIndex/$total - $currentTitle ($pctStr) $barStr"
+
+        if ($cfg.SHOW_TITLE -eq "1") {
+            $planTitle = Get-PlanTitle $sourcePath ([int]$cfg.TITLE_MAX_LEN)
+            if ($planTitle) { $line = "$line - $planTitle" }
+        }
+
+        if ($pinnedMarker) {
+            $line = "$line $(Colorize "($labelPinned)" 'dim')"
+        } elseif ($otherSession) {
+            $line = "$line $(Colorize "($labelOtherSession)" 'dim')"
+        }
+
+        Write-Output $line
     }
 }

@@ -3,12 +3,12 @@
 A status line for [Claude Code](https://claude.com/claude-code) that shows how far along Claude is on the plan it's currently implementing:
 
 ```
-Sonnet 5 | 📋 Task 3/5 - Implementing UI (60%) ██████░░░░
+Sonnet 5 | 📋 Task 3/5 - Implementing UI (60%) ██████░░░░ - Empresas feature
 ```
 
 ## How it works
 
-Claude Code already tracks the steps of a plan internally via its `TodoWrite` tool - the same task list rendered in the CLI UI while Claude works. The status line command receives a JSON payload on stdin that includes `transcript_path`, the path to the session's JSONL transcript. This script reads that transcript, finds the most recent `TodoWrite` call, and renders it as a progress bar.
+Claude Code already tracks the steps of a plan internally via its `TodoWrite` tool - the same task list rendered in the CLI UI while Claude works. The status line command receives a JSON payload on stdin that includes `transcript_path`, the path to the session's JSONL transcript. This script reads that transcript, finds the most recent `TodoWrite` call, and renders it as a progress bar. The plan's name comes from the most recent `ExitPlanMode` call (the plan-approval step) - its first heading line.
 
 No separate progress file, no extra instructions to add to `CLAUDE.md` - it reads state Claude Code already maintains. Ask Claude for a plan, approve it, and watch the status line update as each task flips from `pending` → `in_progress` → `completed`.
 
@@ -58,7 +58,45 @@ pwsh ~/.claude/plan-progress/planprogress.ps1 config -Reset
 
 `--color` (or `-Color`) accepts `auto` (default - green at 100%, cyan mid-progress, yellow early) or a fixed name: `red`, `green`, `yellow`, `blue`, `cyan`, `purple`, `orange`, `white`, `dim`, `none`.
 
-Every setting can also be overridden per-invocation with an environment variable (handy for scripting, or if you'd rather not persist anything to disk): `PLAN_PROGRESS_BAR_WIDTH`, `PLAN_PROGRESS_COLOR`, `PLAN_PROGRESS_FILLED_CHAR`, `PLAN_PROGRESS_EMPTY_CHAR`, `PLAN_PROGRESS_NO_EMOJI`, `PLAN_PROGRESS_NO_COLOR`, `PLAN_PROGRESS_ENABLED`, `PLAN_PROGRESS_LOCALE`. Env vars always win over the config file.
+Every setting can also be overridden per-invocation with an environment variable (handy for scripting, or if you'd rather not persist anything to disk): `PLAN_PROGRESS_BAR_WIDTH`, `PLAN_PROGRESS_COLOR`, `PLAN_PROGRESS_FILLED_CHAR`, `PLAN_PROGRESS_EMPTY_CHAR`, `PLAN_PROGRESS_NO_EMOJI`, `PLAN_PROGRESS_NO_COLOR`, `PLAN_PROGRESS_ENABLED`, `PLAN_PROGRESS_LOCALE`, `PLAN_PROGRESS_SHOW_TITLE`, `PLAN_PROGRESS_TITLE_MAX_LEN`, `PLAN_PROGRESS_CROSS_SESSION`, `PLAN_PROGRESS_PINNED_SESSION`. Env vars always win over the config file.
+
+## The plan name
+
+By default the segment ends with a short name for the plan, taken from the first heading of the most recent approved plan (the `ExitPlanMode` call). Turn it off or change how much of it shows:
+
+```bash
+~/.claude/plan-progress/planprogress.sh config --no-title           # drop the plan name entirely
+~/.claude/plan-progress/planprogress.sh config --title-max-len 25   # shorter/longer before truncating with "…"
+```
+
+```powershell
+pwsh ~/.claude/plan-progress/planprogress.ps1 config -NoTitle
+pwsh ~/.claude/plan-progress/planprogress.ps1 config -TitleMaxLen 25
+```
+
+If Claude implemented a plan without ever presenting one for approval (skip-permissions / non-plan-mode flows), there's no `ExitPlanMode` call to read a name from, so the segment just omits the trailing name.
+
+## Multiple plans across sessions
+
+Each Claude Code session (tab/window) has its own transcript, so by default the status line only knows about **its own** session's plan. Two things build on top of that:
+
+**Automatic fallback.** If the current session has no plan of its own, the script looks at other sessions in the same project (same working directory) and shows the most recently active one with an incomplete plan, tagged `(other session)` / `(otra sesión)` so it's clear it's not this tab's own work. Turn this off with `--no-cross-session` / `-NoCrossSession` if you'd rather see "No active plan" in that case.
+
+**Picking a specific plan.** When several sessions in a project have plans running at once, list them and pin the status line to whichever one you want to watch:
+
+```bash
+~/.claude/plan-progress/planprogress.sh sessions        # list every session's plan + progress
+~/.claude/plan-progress/planprogress.sh use 2           # pin the status line to session #2
+~/.claude/plan-progress/planprogress.sh unpin           # back to automatic behavior
+```
+
+```powershell
+pwsh ~/.claude/plan-progress/planprogress.ps1 sessions
+pwsh ~/.claude/plan-progress/planprogress.ps1 use 2
+pwsh ~/.claude/plan-progress/planprogress.ps1 unpin
+```
+
+A pinned session shows `(pinned)` / `(fijado)` in the status line as a reminder it isn't following the current tab. `sessions`/`use` guess the project's transcript folder from your current directory; pass `--dir <path>` (`-Dir` on Windows) to point at it directly if that guess is off (project folders live under `~/.claude/projects/`).
 
 ## Coexisting with another status line
 
